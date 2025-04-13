@@ -7,6 +7,7 @@ from google.transit import gtfs_realtime_pb2
 import urllib.request
 from datetime import datetime
 import pytz
+import time
 
 # NYC timezone
 nyc_tz = pytz.timezone('America/New_York')
@@ -81,7 +82,6 @@ def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop, trip_head
 
             found_start = None
             found_end = None
-            # Try exact match first
             headsign = trip_headsign_map.get(trip_id)
 
             if not headsign:
@@ -90,6 +90,10 @@ def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop, trip_head
                         headsign = v
                         break
 
+            delay = None
+            if trip.trip.HasField("schedule_relationship"):
+                delay = trip.trip.schedule_relationship
+
             for update in stop_updates:
                 stop_id = update.stop_id
                 if stop_id.startswith(start_base) and update.HasField('arrival'):
@@ -97,27 +101,27 @@ def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop, trip_head
                 if stop_id.startswith(end_base) and update.HasField('arrival'):
                     found_end = update.arrival.time
 
-            # Add only if both start and end exist and are in correct order
             if found_start and found_end and found_start < found_end and found_start > now:
                 minutes_away = int((found_start - now) / 60)
                 arrival_time = datetime.fromtimestamp(found_start, tz=nyc_tz).strftime('%I:%M:%S %p')
                 destination_time = datetime.fromtimestamp(found_end, tz=nyc_tz).strftime('%I:%M:%S %p')
-                stop_name = stop_id_to_name.get(start_base, "Unknown Stop")
+                status = "Delayed" if delay else "On Time"
                 data.append({
                     'Train': route_id,
                     'From': start_stop,
                     'To': end_stop,
                     'Arrival Time (Exact)': arrival_time,
                     'Arriving In': f"{minutes_away} min",
-                    # 'Headsign': headsign,  # Display train destination
-                    'Destination Arrival Time': destination_time  # Time at end station
+                    # 'Headsign': headsign or "Unknown",
+                    'Destination Arrival Time': destination_time,
+                    'Status': status
                 })
 
     return pd.DataFrame(data)
 
-
 # ------------------------- Streamlit UI ----------------------------
-st.title("🚇 NYC Subway Real-time Tracker")
+st.set_page_config(page_title="NYC Subway Real-time Tracker", layout="wide")
+st.markdown("### 🚇 NYC Subway Real-time Tracker")
 
 feed_name = st.selectbox("Select a subway line:", list(FEED_URLS.keys()))
 feed_url = FEED_URLS[feed_name]
@@ -132,12 +136,27 @@ stop_id_to_name = dict(zip(stops['stop_id'].str[:3], stops['stop_name']))
 start_stop = st.selectbox("Select the starting station", line_stops['stop_name'].unique())
 end_stop = st.selectbox("Select the ending station", line_stops['stop_name'].unique())
 
-if st.button("🔍 Get Real-time Arrivals"):
-    feed = fetch_subway_feed(feed_url)
-    if feed:
-        df = parse_feed(feed, stops, stop_id_to_name, start_stop, end_stop, trip_headsign_map)
-        if not df.empty:
-            st.success("Live arrival info loaded:")
-            st.dataframe(df)
-        else:
-            st.warning("No upcoming trains found between selected stops.")
+with st.expander("⚙️ Auto-refresh settings", expanded=False):
+    auto_refresh = st.checkbox("Enable auto-refresh", value=False)
+    refresh_interval = None
+    if auto_refresh:
+        refresh_interval = st.slider("Auto-refresh interval (seconds)", min_value=10, max_value=120, value=30)
+
+placeholder = st.empty()
+run_tracker = st.button("🔍 Start Tracking")
+
+if run_tracker or auto_refresh:
+    while True:
+        with placeholder.container():
+            feed = fetch_subway_feed(feed_url)
+            if feed:
+                df = parse_feed(feed, stops, stop_id_to_name, start_stop, end_stop, trip_headsign_map)
+                if not df.empty:
+                    st.success("Live arrival info loaded:")
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.warning("No upcoming trains found between selected stops.")
+        if not auto_refresh:
+            break
+        time.sleep(refresh_interval)
+        st.rerun()
