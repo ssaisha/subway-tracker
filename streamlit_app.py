@@ -7,7 +7,8 @@ from google.transit import gtfs_realtime_pb2
 import urllib.request
 from datetime import datetime
 import pytz
-import time
+import folium
+from streamlit_folium import st_folium
 
 # NYC timezone
 nyc_tz = pytz.timezone('America/New_York')
@@ -26,13 +27,20 @@ FEED_URLS = {
     "S": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs"
 }
 
+# Use session_state to track data
+if 'df' not in st.session_state:
+    st.session_state['df'] = pd.DataFrame()
+
+if 'selected_trip_id' not in st.session_state:
+    st.session_state['selected_trip_id'] = None
+
 @st.cache_resource
 def load_gtfs_static_data():
     url = "http://web.mta.info/developers/data/nyct/subway/google_transit.zip"
     response = requests.get(url)
     if response.status_code != 200:
         st.error("Failed to download GTFS static data.")
-        return None, None, None, None
+        return None, None, None, None, None
 
     zf = zipfile.ZipFile(BytesIO(response.content))
     routes = pd.read_csv(zf.open('routes.txt'))
@@ -114,10 +122,46 @@ def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop, trip_head
                     'Arriving In': f"{minutes_away} min",
                     # 'Headsign': headsign or "Unknown",
                     'Destination Arrival Time': destination_time,
-                    'Status': status
+                    'Status': status,
+                    'Trip ID': trip_id
                 })
 
     return pd.DataFrame(data)
+
+def plot_selected_trip_on_map(trip_id, feed, stops):
+    now = datetime.now(nyc_tz).timestamp()
+    trip_stops = []
+
+    for entity in feed.entity:
+        if entity.HasField('trip_update') and entity.trip_update.trip.trip_id == trip_id:
+            for update in entity.trip_update.stop_time_update:
+                stop_match = stops[stops['stop_id'].str.startswith(update.stop_id[:3])]
+                if not stop_match.empty and update.HasField('arrival'):
+                    stop_info = stop_match.iloc[0]
+                    arrival_time = datetime.fromtimestamp(update.arrival.time, tz=nyc_tz).strftime('%I:%M:%S %p')
+                    trip_stops.append({
+                        'stop_name': stop_info['stop_name'],
+                        'stop_lat': stop_info['stop_lat'],
+                        'stop_lon': stop_info['stop_lon'],
+                        'arrival': arrival_time,
+                        'minutes_away': int((update.arrival.time - now) / 60)
+                    })
+            break
+
+    if not trip_stops:
+        st.warning("No stops found for selected trip.")
+        return None
+
+    subway_map = folium.Map(location=[trip_stops[0]['stop_lat'], trip_stops[0]['stop_lon']], zoom_start=14)
+    for stop in trip_stops:
+        popup = f"{stop['stop_name']}: {stop['arrival']} (in {stop['minutes_away']} min)"
+        folium.Marker(
+            location=[stop['stop_lat'], stop['stop_lon']],
+            popup=popup,
+            icon=folium.Icon(color="blue", icon="info-sign")
+        ).add_to(subway_map)
+
+    return subway_map
 
 # ------------------------- Streamlit UI ----------------------------
 st.set_page_config(page_title="NYC Subway Real-time Tracker", layout="wide")
@@ -133,30 +177,27 @@ if routes is None:
 line_stops = get_stops_for_line(feed_name, routes, trips, stop_times, stops)
 stop_id_to_name = dict(zip(stops['stop_id'].str[:3], stops['stop_name']))
 
-start_stop = st.selectbox("Select the starting station", line_stops['stop_name'].unique())
-end_stop = st.selectbox("Select the ending station", line_stops['stop_name'].unique())
+start_stop = st.selectbox("From:", line_stops['stop_name'].unique())
+end_stop = st.selectbox("To:", line_stops['stop_name'].unique())
 
-with st.expander("⚙️ Auto-refresh settings", expanded=False):
-    auto_refresh = st.checkbox("Enable auto-refresh", value=False)
-    refresh_interval = None
-    if auto_refresh:
-        refresh_interval = st.slider("Auto-refresh interval (seconds)", min_value=10, max_value=120, value=30)
+if st.button("Search Trains"):
+    feed = fetch_subway_feed(feed_url)
+    df = parse_feed(feed, line_stops, stop_id_to_name, start_stop, end_stop, trip_headsign_map)
+    st.session_state['df'] = df
+    if not df.empty:
+        st.session_state['selected_trip_id'] = df.iloc[0]['Trip ID']
+        st.session_state['show_map'] = True
+    else:
+        st.session_state['selected_trip_id'] = None
+        st.session_state['show_map'] = False
 
-placeholder = st.empty()
-run_tracker = st.button("🔍 Start Tracking")
+if not st.session_state['df'].empty:
+    st.dataframe(st.session_state['df'].drop(columns=['Trip ID']), use_container_width=True)
 
-if run_tracker or auto_refresh:
-    while True:
-        with placeholder.container():
-            feed = fetch_subway_feed(feed_url)
-            if feed:
-                df = parse_feed(feed, stops, stop_id_to_name, start_stop, end_stop, trip_headsign_map)
-                if not df.empty:
-                    st.success("Live arrival info loaded:")
-                    st.dataframe(df, use_container_width=True)
-                else:
-                    st.warning("No upcoming trains found between selected stops.")
-        if not auto_refresh:
-            break
-        time.sleep(refresh_interval)
-        st.rerun()
+    if st.session_state['show_map'] and st.session_state['selected_trip_id']:
+        st.markdown("### Subway Route Map (First Trip)")
+        subway_map = plot_selected_trip_on_map(
+            st.session_state['selected_trip_id'], fetch_subway_feed(feed_url), stops
+        )
+        if subway_map:
+            st_folium(subway_map, width=700, height=500)

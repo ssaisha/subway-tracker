@@ -3,3 +3,5 @@ protobuf
 gtfs-realtime-bindings 
 pandas
 pytz
+streamlit-folium 
+folium
