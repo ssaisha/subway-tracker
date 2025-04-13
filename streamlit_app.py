@@ -38,8 +38,9 @@ def load_gtfs_static_data():
     trips = pd.read_csv(zf.open('trips.txt'))
     stop_times = pd.read_csv(zf.open('stop_times.txt'))
     stops = pd.read_csv(zf.open('stops.txt'))
+    trip_headsign_map = dict(zip(trips['trip_id'], trips['trip_headsign']))
 
-    return routes, trips, stop_times, stops
+    return routes, trips, stop_times, stops, trip_headsign_map
 
 def get_stops_for_line(feed_key, routes, trips, stop_times, stops):
     prefix = feed_key.lower().replace('gtfs-', '').split('-')[0]
@@ -60,7 +61,7 @@ def fetch_subway_feed(feed_url):
         st.error(f"Error fetching feed: {e}")
         return None
 
-def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop):
+def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop, trip_headsign_map):
     data = []
     now = datetime.now(nyc_tz).timestamp()
 
@@ -75,23 +76,45 @@ def parse_feed(feed, stop_data, stop_id_to_name, start_stop, end_stop):
         if entity.HasField('trip_update'):
             trip = entity.trip_update
             route_id = trip.trip.route_id
+            stop_updates = trip.stop_time_update
+            trip_id = trip.trip.trip_id
 
-            for stop_time in trip.stop_time_update:
-                stop_id = stop_time.stop_id
+            found_start = None
+            found_end = None
+            # Try exact match first
+            headsign = trip_headsign_map.get(trip_id)
 
-                if stop_id.startswith(start_base) or stop_id.startswith(end_base):
-                    stop_name = stop_id_to_name.get(stop_id[:3], "Unknown Stop")
-                    if stop_time.HasField('arrival'):
-                        arrival_time = stop_time.arrival.time
-                        arrival_time_nyc = datetime.fromtimestamp(arrival_time, tz=nyc_tz).strftime('%I:%M:%S %p')
-                        data.append({
-                            'Train': route_id,
-                            'Stop ID': stop_id,
-                            'Stop Name': stop_name,
-                            'Arrival Time (NYC)': arrival_time_nyc
-                        })
+            if not headsign:
+                for k, v in trip_headsign_map.items():
+                    if trip_id.startswith(k):
+                        headsign = v
+                        break
+
+            for update in stop_updates:
+                stop_id = update.stop_id
+                if stop_id.startswith(start_base) and update.HasField('arrival'):
+                    found_start = update.arrival.time
+                if stop_id.startswith(end_base) and update.HasField('arrival'):
+                    found_end = update.arrival.time
+
+            # Add only if both start and end exist and are in correct order
+            if found_start and found_end and found_start < found_end and found_start > now:
+                minutes_away = int((found_start - now) / 60)
+                arrival_time = datetime.fromtimestamp(found_start, tz=nyc_tz).strftime('%I:%M:%S %p')
+                destination_time = datetime.fromtimestamp(found_end, tz=nyc_tz).strftime('%I:%M:%S %p')
+                stop_name = stop_id_to_name.get(start_base, "Unknown Stop")
+                data.append({
+                    'Train': route_id,
+                    'From': start_stop,
+                    'To': end_stop,
+                    'Arrival Time (Exact)': arrival_time,
+                    'Arriving In': f"{minutes_away} min",
+                    # 'Headsign': headsign,  # Display train destination
+                    'Destination Arrival Time': destination_time  # Time at end station
+                })
 
     return pd.DataFrame(data)
+
 
 # ------------------------- Streamlit UI ----------------------------
 st.title("🚇 NYC Subway Real-time Tracker")
@@ -99,7 +122,7 @@ st.title("🚇 NYC Subway Real-time Tracker")
 feed_name = st.selectbox("Select a subway line:", list(FEED_URLS.keys()))
 feed_url = FEED_URLS[feed_name]
 
-routes, trips, stop_times, stops = load_gtfs_static_data()
+routes, trips, stop_times, stops, trip_headsign_map = load_gtfs_static_data()
 if routes is None:
     st.stop()
 
@@ -112,7 +135,7 @@ end_stop = st.selectbox("Select the ending station", line_stops['stop_name'].uni
 if st.button("🔍 Get Real-time Arrivals"):
     feed = fetch_subway_feed(feed_url)
     if feed:
-        df = parse_feed(feed, stops, stop_id_to_name, start_stop, end_stop)
+        df = parse_feed(feed, stops, stop_id_to_name, start_stop, end_stop, trip_headsign_map)
         if not df.empty:
             st.success("Live arrival info loaded:")
             st.dataframe(df)
